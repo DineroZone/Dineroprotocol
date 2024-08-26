@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts@4.9.6/utils/Strings.sol";
+import  "./VerifyBase.sol";
+import "./SignatureData.sol"; 
+// import "@openzeppelin/contracts@4.9.6/utils/Strings.sol";
 import "@openzeppelin/contracts@4.9.6/access/Ownable.sol";
 import "@openzeppelin/contracts@4.9.6/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts@4.9.6/utils/Math/Math.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 
 
 
 contract DOrderContract is Ownable {
+
+    string public chainId;
+
     address public oracleAddress;
+
+    address public feeAddress;
 
     uint256 public platformFee = 2;     //platform fee 
 
@@ -23,7 +30,7 @@ contract DOrderContract is Ownable {
         uint256 price;
         uint256 balance;
 
-        //1. waiting for buyer  2. waiting for seller  3.both are payed 4.cancel with buyer  5.cancel with seller 6.appeal with buyer 7. appeal with seller 8.cancel 100.finish
+        //1. waiting for buyer  2. waiting for seller  3.both are payed 4.cancel with buyer  5.cancel with seller 6.appeal with buyer 7. appeal with seller 8.cancel    100.finish
         int status;  
     }
 
@@ -36,7 +43,7 @@ contract DOrderContract is Ownable {
 
 
     modifier canCreateOrder(string memory orderId,uint256 totalPrice,int cmd)  {
-        // require(tradeToken != address(0), "Invalid tradeToken address");
+        require(tradeToken != address(0), "Invalid tradeToken address");
 
         IERC20 paymentToken = IERC20(tradeToken);
         require(totalPrice > 0, "Invalid totalPrice");
@@ -53,6 +60,11 @@ contract DOrderContract is Ownable {
         _;
     }
 
+    //set chainId
+    function setChainId(string memory _chainId) external onlyOwner {
+        chainId = _chainId;
+    }
+
     //set trade token
     function setTradeToken(address tokenAddress) external onlyOwner {
         tradeToken = tokenAddress;
@@ -63,7 +75,12 @@ contract DOrderContract is Ownable {
         oracleAddress = _address;
     }
 
-    //set Oracle platformFee 
+    //set Fee Address 
+    function setFeeAddress(address _feeAddress) external onlyOwner {
+        feeAddress = _feeAddress;
+    }
+
+    //set platformFee 
     function setPlatformFee(uint256  _platformFee) external onlyOwner {
         platformFee = _platformFee;
     }
@@ -150,10 +167,6 @@ contract DOrderContract is Ownable {
         );
     }
 
-
-
-
-
     /*************************************************************************************************************************
     *************************************************     private functions   ************************************************
     *************************************************************************************************************************/
@@ -201,7 +214,9 @@ contract DOrderContract is Ownable {
             }
         }
         orderList[orderId].price = totalPrice;
-        orderList[orderId].balance = totalPrice + orderList[orderId].balance;
+        (bool success, uint256 amount) = SafeMath.tryAdd(totalPrice,orderList[orderId].balance);
+        require(success, "SafeMath.tryAdd amount fail");
+        orderList[orderId].balance = amount;
     }
 
 
@@ -240,19 +255,33 @@ contract DOrderContract is Ownable {
     function _cancelOrder(string memory orderId) internal {
 
         //refund to buyer and seller
+        uint256 fee = orderList[orderId].price*platformFee/100;
+        (bool success,uint256 amount) = SafeMath.trySub(orderList[orderId].balance,fee);
+        require(success, "SafeMath.tryAdd amount fail");
         IERC20 paymentToken = IERC20(tradeToken);
-        uint256 totalPrice = orderList[orderId].balance - orderList[orderId].price/100*platformFee;
-        paymentToken.transfer(msg.sender, totalPrice);
+        paymentToken.transfer(msg.sender, amount);
+
+        uint256 feeAmount = orderList[orderId].balance - amount;
+        paymentToken.transfer(feeAddress, feeAmount);
+
         orderList[orderId].balance = 0;
     }
 
     function _cancelAndFinishOrder(string memory orderId) internal {
 
         //refund to buyer and seller
+        uint256 fee = orderList[orderId].price*platformFee/100;
+        (bool success,uint256 amount) = SafeMath.trySub(orderList[orderId].balance,fee);
+        require(success, "SafeMath.tryAdd amount fail");
+
+
         IERC20 paymentToken = IERC20(tradeToken);
-        uint256 totalPrice = orderList[orderId].balance/2 - orderList[orderId].price/100*platformFee;
-        paymentToken.transfer(orderList[orderId].buyer, totalPrice);
-        paymentToken.transfer(orderList[orderId].seller, totalPrice);
+        paymentToken.transfer(orderList[orderId].buyer, amount/2);
+        paymentToken.transfer(orderList[orderId].seller, amount/2);
+
+        uint256 feeAmount = orderList[orderId].balance - amount;
+        paymentToken.transfer(feeAddress, feeAmount);
+
         orderList[orderId].balance = 0;
     }
 
@@ -262,78 +291,101 @@ contract DOrderContract is Ownable {
 
         orderList[orderId].status = 100;
 
+        uint256 fee = orderList[orderId].price/100*platformFee;
+        (bool success,uint256 amount) = SafeMath.trySub(orderList[orderId].balance,fee);
+        require(success, "SafeMath.tryAdd amount fail");
+
         IERC20 paymentToken = IERC20(tradeToken);
-        uint256 totalPrice = orderList[orderId].balance - orderList[orderId].price/100*platformFee;
-        paymentToken.transfer(orderList[orderId].seller, totalPrice);
+        paymentToken.transfer(orderList[orderId].seller, amount);
+
+
+        uint256 feeAmount = orderList[orderId].balance - amount;
+        paymentToken.transfer(feeAddress, feeAmount);
+
         orderList[orderId].balance = 0;
     }
 
-
-
     function _finishOrderBySeller(string memory orderId,string memory passData) internal {
-        require(orderList[orderId].buyer == msg.sender, "Can't find your order");
-        require(orderList[orderId].seller != address(0), "The order can't finish,because can't find the seller");
+        require(orderList[orderId].seller == msg.sender, "Can't find your order");
+        require(orderList[orderId].buyer != address(0), "The order can't finish,because can't find the buyer");
+        require(orderList[orderId].balance > 0, "The order balance is 0");
 
-        //verify passData
-        bytes memory packedMessage = toPackedMessage(orderId, msg.sender, 100); //type = 2 is finish
-        bytes32 messageHash = toEthSignedMessageHash(packedMessage);
-        bool isSignatureValid = verifySignature(oracleAddress, messageHash, passData);
+        bool isSignatureValid = callVerifySignature(chainId, address(this), oracleAddress, msg.sender, "100", orderId,passData);
         require(isSignatureValid, "Invalid signature");
-        //verify end
+
 
         orderList[orderId].status = 100;
 
         IERC20 paymentToken = IERC20(tradeToken);
         uint256 totalPrice = orderList[orderId].balance - orderList[orderId].price/100*platformFee ;
         paymentToken.transfer(orderList[orderId].seller, totalPrice);
+
+        uint256 feeAmount = orderList[orderId].balance - totalPrice;
+        paymentToken.transfer(feeAddress, feeAmount);
+
         orderList[orderId].balance = 0;
     }
 
+    function callVerifySignature(
+        string memory _chainId,
+        address contractAddress,
+        address serverAddress,
+        address userAddress,
+        string memory signatureType,
+        string memory s1,
+        string memory serverSignature
+    ) public view returns (bool) {
+        // 创建 SignatureData 实例
+        SignatureData memory signatureData = SignatureData({
+            chainId: _chainId,
+            contractAddress: contractAddress,
+            serverAddress: serverAddress,
+            userAddress: userAddress,
+            signatureType: signatureType,
+            s1: s1
+        });
 
-
-    /*
-     * verify for oracel
-     */
-    function toPackedMessage(
-        string memory orderId, // 32 bytes
-        address _address, // 20 bytes
-        uint8 _signType // 1 byte
-    ) internal view returns (bytes memory) {
-        address contractAddress = address(this); // 20 bytes
-        return abi.encodePacked(orderId, _address, contractAddress, _signType);
+        // call verifySignature of VerifyBase
+        return  verifySignature(signatureData, serverSignature);
     }
 
-    // Verify ECDSA signature
-    function verifySignature(
-        address _address,
-        bytes32 _hash,
-        string memory _signature
-    ) internal pure returns (bool) {
-        bytes memory signatureBytes = bytes(_signature);
-        // 目前只能用assembly (内联汇编)来从签名中获得r,s,v的值
-        bytes memory r_bytes = new bytes(64);
-        bytes memory s_bytes = new bytes(64);
-        bytes memory v_bytes = new bytes(2);
-        assembly {
-            mstore(add(r_bytes, 0x20), mload(add(signatureBytes, 0x20)))
-            mstore(add(r_bytes, 0x40), mload(add(signatureBytes, 0x40)))
-            mstore(add(s_bytes, 0x20), mload(add(signatureBytes, 0x60)))
-            mstore(add(s_bytes, 0x40), mload(add(signatureBytes, 0x80)))
-            mstore(add(v_bytes, 0x20), mload(add(signatureBytes, 0xA0)))
-        }
-        bytes32 r = (bytes32FromHexString(string(r_bytes)));
-        bytes32 s = (bytes32FromHexString(string(s_bytes)));
-        uint8 v = uint8(bytes1FromHexString(string(v_bytes)));
-        address signer = ecrecover(_hash, v, r, s);
-        if (signer == address(0)) {
+
+
+    /*************************************************************************************************************************
+    *************************************************     verify base   ************************************************
+    *************************************************************************************************************************/
+
+    function strCmp(string memory left, string memory right) internal pure returns (bool) {
+        bytes memory leftBytes = bytes(left);
+        bytes memory rightBytes = bytes(right);
+        if (leftBytes.length != rightBytes.length) {
             return false;
         }
-        if (signer != _address) {
-            return false;
+        uint256 n = leftBytes.length;
+        for (uint i = 0; i < n; i ++) {
+            if(leftBytes[i] != rightBytes[i]) {
+                return false;
+            }
         }
         return true;
     }
 
+    function bytesToHexString(bytes memory data) internal pure returns (string memory) {
+        uint256 dataLength = data.length;
+        uint256 textBytesLength = dataLength * 2;
+        bytes memory textBytes = new bytes(textBytesLength);
+        for (uint256 i = 0; i < dataLength; i++) {
+            uint32 value = uint32(uint8(data[i]));
+            uint32 hi = value >> 4;
+            uint32 lo = value & 0x0f;
+            uint32 c1 = hi + 48 + (hi / 10) * 39;
+            uint32 c2 = lo + 48 + (lo / 10) * 39;
+            textBytes[i * 2] = bytes1(uint8(c1));
+            textBytes[i * 2 + 1] = bytes1(uint8(c2));
+        }
+        string memory text = string(textBytes);
+        return text;
+    }
 
     function bytesFromHexString(string memory text) internal pure returns (bytes memory) {
         bytes memory textBytes = bytes(text);
@@ -365,6 +417,17 @@ contract DOrderContract is Ownable {
         return data;
     }
 
+    function bytes20FromHexString(string memory text) internal pure returns (bytes20) {
+        bytes memory dataBytes = bytesFromHexString(text);
+        uint256 dataLength = dataBytes.length;
+        require(dataLength == 20, "The text is not bytes20 hex format");
+        bytes20 data;
+        assembly {
+            data := mload(add(dataBytes, 0x20))
+        }
+        return data;
+    }
+
     function bytes32FromHexString(string memory text) internal pure returns (bytes32) {
         bytes memory dataBytes = bytesFromHexString(text);
         uint256 dataLength = dataBytes.length;
@@ -381,4 +444,69 @@ contract DOrderContract is Ownable {
         string memory len = Strings.toString(_message.length);
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n", len, _message));
     }
+
+    // Verify ECDSA signature
+    function verifySignatureImpl(
+        address _address,
+        bytes32 _hash,
+        string memory _signature
+    ) internal pure returns (bool) {
+        bytes memory signatureBytes = bytes(_signature);
+        // 目前只能用assembly (内联汇编)来从签名中获得r,s,v的值
+        bytes memory r_bytes = new bytes(64);
+        bytes memory s_bytes = new bytes(64);
+        bytes memory v_bytes = new bytes(2);
+        assembly {
+            mstore(add(r_bytes, 0x20), mload(add(signatureBytes, 0x20)))
+            mstore(add(r_bytes, 0x40), mload(add(signatureBytes, 0x40)))
+            mstore(add(s_bytes, 0x20), mload(add(signatureBytes, 0x60)))
+            mstore(add(s_bytes, 0x40), mload(add(signatureBytes, 0x80)))
+            mstore(add(v_bytes, 0x20), mload(add(signatureBytes, 0xA0)))
+        }
+        bytes32 r = (bytes32FromHexString(string(r_bytes)));
+        bytes32 s = (bytes32FromHexString(string(s_bytes)));
+        uint8 v = uint8(bytes1FromHexString(string(v_bytes)));
+        address signer = ecrecover(_hash, v, r, s);
+        if (signer == address(0)) {
+            return false;
+        }
+        if (signer != _address) {
+            return false;
+        }
+        return true;
+    }
+
+    function toPackedBytes(string memory str) public pure returns (bytes memory) {
+        bytes memory packedBytes = abi.encodePacked(
+            bytes(str).length, // 32 bytes
+            str
+        );
+        return packedBytes;
+    }
+
+    function toPackedMessage(
+        SignatureData memory signatureData
+    ) public pure returns (bytes memory) {
+        return abi.encodePacked(
+            toPackedBytes(signatureData.chainId),
+            signatureData.contractAddress, // 20 bytes
+            signatureData.serverAddress, // 20 bytes
+            signatureData.userAddress, // 20 bytes
+            toPackedBytes(signatureData.signatureType),
+            toPackedBytes(signatureData.s1)
+        );
+    }
+
+    function verifySignature(SignatureData memory signatureData, string memory serverSignature) public view returns (bool) {
+        require(strCmp(signatureData.chainId, chainId));
+        require(signatureData.contractAddress == address(this));
+        require(signatureData.serverAddress == oracleAddress);
+        require(signatureData.userAddress == msg.sender);
+
+        bytes memory packedMessage = toPackedMessage(signatureData);
+        bytes32 messageHash = toEthSignedMessageHash(packedMessage);
+        bool isSignatureValid = verifySignatureImpl(oracleAddress, messageHash, serverSignature);
+        return isSignatureValid;
+    }
+
 }
